@@ -7,7 +7,10 @@
 进行中的开封请求补票；封存人也可就未开封资料向另一名本地账号**发起交接邀请**，
 受让人在截止前确认后成为新封存人。封存人还可为资料**安排到期清除时刻**：
 到点清空正文（保留摘要、参与方与审计元数据），到期前可改期或取消，
-交接后由新封存人管理。技术栈：Python 3.11 + FastAPI + SQLite。
+交接后由新封存人管理。资料参与方可在到点开封、清除等结算完成后**签发
+带 Ed25519 签名的审计快照**（含编号、摘要、状态、时刻与标明截止序号的
+原序审计记录，不含正文或密钥），离线复核人凭事先信任的公钥即可公开验真，
+服务重启后旧签名仍可验证。技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
 
@@ -37,7 +40,13 @@
 | 已清除不可再操作 | 已清除资料不能再开封、替换见证人、发起/确认交接或再安排清除；已到期的改期或取消一律 `409`；一切拒绝路径不泄露正文 |
 | 拒绝且状态不变 | 失效凭据(401)、非见证人(403)、无效时限(400/422)、重复开封(409) 等任何拒绝路径都不写数据（到点自动开封/清除的提交除外：状态变更先落库，拒绝在提交后返回） |
 | 并发只产生一个结果 | 全部“检查 + 写入”在 SQLite `BEGIN IMMEDIATE` 短事务内完成；并发同意/撤销/定时开封/到期/替换见证人/交接发起、撤回、确认/到期清除只有一个已提交终态（同意在锁内以“当前名单”复核见证人身份；交接与第二票同意赛跑时要么开封要么交接，互斥且唯一） |
-| 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`（含 `handover_invited/confirmed/revoked/expired`、`request_invalidated`、`purge_scheduled/rescheduled/canceled`、`purged`）；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
+| 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`（含 `handover_invited/confirmed/revoked/expired`、`request_invalidated`、`purge_scheduled/rescheduled/canceled`、`purged`、`audit_snapshot_issued`）；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
+| 审计快照签发 | 当前封存人或当前指定见证人可对某份资料签发签名审计快照（`POST /documents/{id}/audit-snapshot`）：含资料编号、摘要、当前状态、开封/清除时刻、按原顺序排列且标明截止序号 `cutoff_seq` 的审计记录；**不含正文，也不含任何密钥** |
+| 快照对应已提交一致状态 | 签发在 `BEGIN IMMEDIATE` 临界区内先跑完所有到点结算（到点开封 → 到期清除 → 请求到期 → 邀请逾期），再在同一事务读状态与审计，不能把并发操作后的状态与之前的审计拼接 |
+| 快照非对称签名 | 每账号一把 **Ed25519** 密钥（首次使用惰性生成，私钥落库）；返回 `{snapshot, signature, key_id}`，其中 `key_id=ed25519:<sha256(公钥)>` 只是公钥标识，响应**不含公钥本身**；私钥随库持久化，重启后旧签名仍可验证 |
+| 事先信任的公钥 | 复核人须通过带外渠道事先取得签发方公钥（`GET /me/signing-key`，32 字节原始公钥的标准 base64，亦接受 PEM）；验真只使用提交的 `trusted_public_key`，**绝不以包内自带公钥建立信任**（快照结构上禁止携带公钥字段，多字段即失败） |
+| 公开离线验真 | `POST /audit-snapshots/verify` 无需账号密钥；字段/记录内容被篡改、记录顺序被打乱、记录截断或拼接、截止序号不一致、签名不匹配、版本不支持、公钥无效都返回 HTTP 200 + `valid:false` 与机器可读 `reason`；成功返回 `valid:true` 与 `cutoff_seq` |
+| 快照签发权限 | 交接后旧封存人、被替换掉的旧见证人立即不能签发（锁内以当前 owner/名单复核）；非参与方与不存在资料统一 `403`，不区分资料是否存在 |
 
 ### 请求状态机
 
@@ -123,6 +132,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | POST | `/register` | 注册，返回一次性 `api_key` |
 | GET | `/me` | 查询当前密钥对应的账号 |
+| GET | `/me/signing-key` | 本账号审计快照签名公钥与公钥标识（首次访问惰性生成，之后稳定） |
 | POST | `/documents` | 封存资料：`{body, witnesses:[3人]}`，返回 `digest`（无正文） |
 | GET | `/documents` | 列出本人封存/见证的资料（仅元数据，含 `purge_at`/`purged_at`） |
 | GET | `/documents/{id}` | 详情；开封后才含 `body`、`reason`、`witness_approvals`；已清除返回 `purged` 与清除时刻 |
@@ -137,6 +147,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | PUT | `/documents/{id}/purge` | 封存人安排/改期到期清除时刻：`{purge_at}`（带时区、未来时刻） |
 | DELETE | `/documents/{id}/purge` | 封存人在清除时刻到来前取消已安排的清除 |
 | GET | `/documents/{id}/audit` | 按顺序返回该资料的全部操作记录 |
+| POST | `/documents/{id}/audit-snapshot` | **参与方**（当前封存人/当前见证人）签发当前已提交状态的审计快照：返回 `{snapshot, signature, key_id}`（无正文、无公钥） |
+| POST | `/audit-snapshots/verify` | **公开**（无需密钥）离线验真：提交 `{snapshot, signature, trusted_public_key}`，返回 `valid/reason/cutoff_seq` |
 
 状态码：成功 `200/201`；参数校验失败 `422`（如时间不带时区、`earliest_open_at`
 不早于 `deadline`）；业务校验失败 `400`（如三人不互异、截止时刻已过、最早开封时刻
@@ -408,6 +420,110 @@ curl -sS $BASE/documents/1 -H "X-API-Key: $OWNER_KEY"
 #   没有安排仍取消 409；已清除资料再开封/替换见证人/交接 409。
 ```
 
+### 审计快照与离线验真（audit snapshot）
+
+资料参与方（**当前封存人**或**当前指定见证人**）可在到点开封、清除等结算
+完成后，对某份资料签发一份**带非对称签名的审计快照**，交给离线复核人核验。
+
+**密钥与信任模型**
+
+- 每个账号一把 **Ed25519** 签名密钥，首次访问 `GET /me/signing-key` 时惰性
+  生成，私钥以原始字节存入库（`signing_keys` 表）；重启后密钥不变，旧签名
+  随时可用同一公钥验证。
+- `GET /me/signing-key` 返回 `key_id`（`ed25519:` + 公钥 SHA-256 十六进制）
+  与 `public_key`（32 字节原始公钥的标准 base64）。复核人须通过**带外渠道**
+  （当面、组织 PKI、U 盘等）事先取得并信任该公钥。
+- 签发响应**只返回公钥标识 `key_id`，不含公钥本身**；快照结构上也**禁止携带
+  公钥字段**。验真只信任请求里显式提交的 `trusted_public_key`，服务端绝不以
+  包内自带材料建立信任。
+
+**快照内容（不含正文、不含密钥）**
+
+```json
+{
+  "version": "seal-audit-snapshot/v1",
+  "document_id": 1,
+  "digest": "ab12…",
+  "status": "opened",
+  "opened_at": "2026-10-01T12:00:00+00:00",
+  "purged_at": null,
+  "issued_at": "2026-10-01T12:05:00.123456+00:00",
+  "issuer": "alice",
+  "cutoff_seq": 10,
+  "records": [
+    {"seq": 1, "at": "…", "action": "seal", "actor": "alice", "detail": "…"},
+    {"seq": 2, "at": "…", "action": "open_request_created", "actor": "alice", "detail": "…"}
+  ]
+}
+```
+
+- 记录按审计自增序号**原顺序严格递增**排列；`cutoff_seq` 标明截止序号
+  （= 最后一条记录的序号，无记录为 0），快照即“该序号为止”的已提交历史。
+- 签名对象是快照的**规范化 JSON**（UTF-8、紧凑分隔符 `,`/`:`、键序固定、
+  不转义非 ASCII），任何字段或顺序的字节级改动都会使验签失败。
+
+**一致状态保证**：签发进入 `BEGIN IMMEDIATE` 临界区后，先把所有“到点即定”
+的结算全部跑完（到点开封 → 到期清除 → 过截止请求失效 → 交接邀请逾期），
+再在同一事务内读取资料行与审计行并签名——快照不可能出现“新状态 + 旧审计”
+的拼接。签发本身会追加一条 `audit_snapshot_issued` 审计（不进入本次快照，
+但会出现在下一次快照中），历史快照仍永久可验。
+
+**权限**：交接后的旧封存人、被替换掉的旧见证人立即失去签发资格；非参与方
+与不存在资料统一 `403`（不区分资料是否存在）。
+
+**验真结果**（HTTP 始终 200，以 `valid` 表示）：
+
+| reason | 含义 |
+| --- | --- |
+| `ok` | 验真通过（另回 `cutoff_seq/document_id/issuer/status/digest/trusted_key_id`） |
+| `version_unsupported` | 快照版本不受支持 |
+| `snapshot_malformed` | 快照不是对象、字段缺失/多余（含夹带公钥字段）、字段类型非法 |
+| `records_out_of_order` | 审计记录未按原顺序严格递增 |
+| `cutoff_seq_mismatch` | 截止序号与记录不一致（截断/拼接） |
+| `public_key_invalid` | 提交的信任公钥无法解析（非 Ed25519、长度不对、乱码） |
+| `signature_mismatch` | 签名与快照/信任公钥不匹配（含字段被篡改、用错公钥、伪造签名） |
+
+```bash
+# 1) 签发方（alice）事先公布公钥，复核人带外保存为 trusted-key.txt
+curl -sS $BASE/me/signing-key -H "X-API-Key: $OWNER_KEY"
+# -> {"algorithm":"Ed25519","key_id":"ed25519:…",
+#     "public_key":"xAcMIQguw0lQ24YVZKsleXYJXPW45ptLpdHk+YCOy6U=", ...}
+
+# 2) 开封/清除等结算完成后，当前封存人（或任一当前见证人）签发快照
+curl -sS -X POST $BASE/documents/1/audit-snapshot -H "X-API-Key: $OWNER_KEY"
+# -> {"snapshot":{...,"status":"opened","cutoff_seq":10,"records":[...]},
+#     "signature":"<88字节签名的base64>","key_id":"ed25519:…",
+#     "algorithm":"Ed25519",...}      # 无 body、无 public_key
+
+# 3) 复核人（任何人，无需注册账号/API Key）提交快照、签名与事先信任的公钥
+curl -sS -X POST $BASE/audit-snapshots/verify -H 'Content-Type: application/json' -d '{
+  "snapshot": <上一步的 snapshot 对象>,
+  "signature": "<上一步的 signature>",
+  "trusted_public_key": "<事先带外信任的 public_key>"
+}'
+# -> {"valid":true,"reason":"ok","cutoff_seq":10,"document_id":1,
+#     "issuer":"alice","status":"opened","digest":"ab12…",
+#     "trusted_key_id":"ed25519:…"}
+
+# 4) 失败均为明确的 valid=false（HTTP 200），例如：
+#    改字段/伪造签名/用错公钥 -> signature_mismatch
+#    打乱 records 顺序       -> records_out_of_order
+#    截断记录后伪造截止序号   -> signature_mismatch（只删记录则 cutoff_seq_mismatch）
+#    快照夹带 "public_key"    -> snapshot_malformed
+#    version 改为未知版本     -> version_unsupported
+#    信任公钥乱码/长度不对     -> public_key_invalid
+
+# 5) 交接后旧封存人签发 -> 403；新封存人签发的快照要用新封存人的公钥验证
+```
+
+完全离线（不联系服务）的本地验真工具：
+
+```bash
+python3 examples/verify_snapshot_offline.py \
+    --pack snapshot-pack.json --public-key trusted-key.txt
+# 退出码 0 验真通过（打印 cutoff_seq/状态/摘要/时刻等）；任何失败退出码 2
+```
+
 ### 调用示例（curl）
 
 ```bash
@@ -462,6 +578,8 @@ python3 examples/demo_scheduled.py       # 最早开封时刻：waiting -> 自�
 python3 examples/demo_replace_witness.py # 见证人替换：直接换人 / 退票补票 / waiting 退回待同意
 python3 examples/demo_handover.py        # 封存人交接：邀请/撤回/逾期/确认失效旧请求/转移身份/开封后邀请失效
 python3 examples/demo_purge.py           # 到期清除：安排/改期/取消/到点清除/连带失效/时序规则/交接后管理权
+python3 examples/demo_audit_snapshot.py  # 审计快照：签发/公开验真/各类篡改明确失败/交接后旧封存人失权
+python3 examples/verify_snapshot_offline.py  # 纯离线（不联系服务）本地验真工具
 ```
 
 ### 典型拒绝场景
@@ -505,20 +623,28 @@ python -m pytest -q
 开封更早先开后清（含延迟处理补开）、清除更早则不开封、已清除资料全部写操作 `409`、
 已到期的改期/取消被拒且清除先生效、交接后清除管理权转移、停机期间到点的重启恢复、
 冷读库一致、旧库（无 purge 列/旧 CHECK 约束）幂等迁移，以及真实 uvicorn + 多线程的
-**并发确认 + 同意 vs 到点清除**（两者均被拒，唯一 `purged` 终态）。
+**并发确认 + 同意 vs 到点清除**（两者均被拒，唯一 `purged` 终态）；
+另含审计快照：快照形状（编号/摘要/状态/开封/清除时刻/截止序号/原顺序记录、
+不含正文与公钥）、封存人与三名见证人签发、非参与方与不存在资料统一 403、
+交接后旧封存人与替换后旧见证人失权、开封/清除/停机期间到点后签发均对应已提交
+一致状态、快照恰好是审计前缀（不可拼接）、公开验真通过（含 PEM 公钥）、
+字段篡改/记录乱序/截断伪造截止序号/错误公钥/伪造包内公钥/未知版本/无效公钥均
+明确失败、真实 uvicorn 并发“第二票同意 vs 签发”只可能得到两种一致终态之一、
+以及服务重启后旧签名仍可用同一公钥验证、同一账号公钥不变。
 
 ## 项目结构
 
 ```
 app/
   config.py     # 环境变量配置
-  db.py         # SQLite 连接、建表与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范
-  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻入参校验）
-  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除）
+  db.py         # SQLite 连接、建表（含 signing_keys 签名密钥表）与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范
+  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、快照验真入参校验）
+  signing.py    # Ed25519 密钥生成/签名、快照规范化 JSON、结构/顺序/截止序号校验与离线验真（原因码）
+  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发/验真）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、并发、重启）
+examples/       # demo.sh / demo*.py 端到端示例；demo_audit_snapshot.py 快照签发验真、verify_snapshot_offline.py 纯离线验真工具
+tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、并发、重启）
 Dockerfile
 docker-compose.yml
 ```

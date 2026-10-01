@@ -37,6 +37,15 @@
   待确认交接邀请失效；清除与最早开封同刻时清除优先，开封更早则先开封；
   已清除资料不能再开封、替换见证人、交接或再安排清除；已到期的改期或取消
   一律拒绝且不泄露正文；
+- 资料参与方可在到点开封、清除等结算完成后签发某份资料的审计快照
+  （Ed25519 非对称签名）：快照含资料编号、摘要、当前状态与开封/清除时刻、
+  按原顺序排列并标明截止序号的审计记录，不含正文或密钥；签发返回快照、
+  签名与公钥标识（不含公钥）。签名密钥随库持久化，重启后旧签名仍可验证。
+  离线复核人凭事先信任的公钥调用公开验真接口：字段或记录顺序被篡改、
+  签名不匹配、版本不支持或公钥无效均明确失败；服务端绝不以包内自带公钥
+  建立信任。签发必须对应一个已提交的一致状态（状态、摘要与审计在同一
+  写临界区读取，不能把并发操作后的状态与之前的审计拼接）；交接后旧
+  封存人不得再签发；非参与方与不存在资料沿用统一拒绝语义；
 - 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销/定时开封/
   到期/替换见证人/交接确认/到期清除只有一个已提交结果；
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
@@ -65,6 +74,15 @@ from .schemas import (
     ReplaceWitnessIn,
     RevokeIn,
     SealIn,
+    SnapshotVerifyIn,
+)
+from .signing import (
+    SNAPSHOT_VERSION,
+    SnapshotError,
+    generate_keypair,
+    public_key_id,
+    sign_snapshot,
+    verify_snapshot,
 )
 
 # ---------------------------------------------------------------------------
@@ -354,6 +372,35 @@ def settle_due_purges_for_read(db: sqlite3.Connection, document_id: int | None =
         purge_due_documents(tx, utc_str(now_utc()), document_id)
 
 
+def expire_due_requests(tx: sqlite3.Connection, now: str) -> int:
+    """在已持有的写事务内把已过截止时刻仍 pending 的开封请求确定性置为 expired。
+
+    waiting 请求必然满足 earliest_open_at < deadline，到点已由
+    resolve_due_waiting 开封，不会走到这里；pending 请求若已过截止时刻仍
+    未集齐两票则失效（其同意永久不能用于后续请求，与扫描器既有行为一致）。
+    返回失效条数。
+    """
+    rows = tx.execute(
+        "SELECT id, document_id FROM open_requests"
+        " WHERE status = 'pending' AND deadline <= ?",
+        (now,),
+    ).fetchall()
+    for row in rows:
+        tx.execute(
+            "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
+            (now, row["id"]),
+        )
+        add_audit(
+            tx,
+            actor_id=None,
+            action="request_expired",
+            document_id=row["document_id"],
+            request_id=row["id"],
+            detail="开封请求到期前未取得两名不同见证人同意，请求失效，已有同意作废",
+        )
+    return len(rows)
+
+
 def expire_due_invitations(tx: sqlite3.Connection, now: str, invitation_id: int | None = None) -> int:
     """在已持有的写事务内把已过确认截止时刻仍 pending 的交接邀请确定性置为 expired。
 
@@ -432,27 +479,10 @@ class ExpirySweeper:
                 # 旧同意与待确认交接邀请在 purge_document_now 内一并结算。
                 purge_due_documents(tx, now)
                 # 第三步：到截止时刻仍未集齐两票（pending）的请求失效。
-                rows = tx.execute(
-                    "SELECT id, document_id FROM open_requests"
-                    " WHERE status = 'pending' AND deadline <= ?",
-                    (now,),
-                ).fetchall()
-                for row in rows:
-                    tx.execute(
-                        "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
-                        (now, row["id"]),
-                    )
-                    add_audit(
-                        tx,
-                        actor_id=None,
-                        action="request_expired",
-                        document_id=row["document_id"],
-                        request_id=row["id"],
-                        detail="开封请求到期前未取得两名不同见证人同意，请求失效，已有同意作废",
-                    )
+                expired_count = expire_due_requests(tx, now)
                 # 第四步：过确认截止时刻仍待确认的交接邀请失效（逾期后可重新邀请）。
                 expire_due_invitations(tx, now)
-                return len(rows)
+                return expired_count
         finally:
             conn.close()
 
@@ -471,7 +501,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -548,6 +578,51 @@ def register(payload: RegisterIn, db: sqlite3.Connection = Depends(get_db)) -> d
 @app.get("/me")
 def me(user: sqlite3.Row = Depends(current_user)) -> dict[str, Any]:
     return {"user_id": user["id"], "username": user["username"]}
+
+
+def get_or_create_signing_key(tx: sqlite3.Connection, user: sqlite3.Row) -> dict[str, str]:
+    """在已持有的写事务内取本账号 Ed25519 签名密钥；首次使用时惰性生成并落库。
+
+    返回 private_key/public_key/key_id（调用方只把 public_key/key_id 对外暴露）。
+    私钥持久化在 signing_keys 表：服务重启后同一账号继续用同一私钥签发，
+    历史签名仍可用此前发布的公钥验证。
+    """
+    row = tx.execute(
+        "SELECT private_key, public_key, key_id FROM signing_keys WHERE user_id = ?",
+        (user["id"],),
+    ).fetchone()
+    if row is None:
+        priv_b64, pub_b64, key_id = generate_keypair()
+        tx.execute(
+            "INSERT INTO signing_keys (user_id, private_key, public_key, key_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (user["id"], priv_b64, pub_b64, key_id, utc_str(now_utc())),
+        )
+        return {"private_key": priv_b64, "public_key": pub_b64, "key_id": key_id}
+    return {"private_key": row["private_key"], "public_key": row["public_key"],
+            "key_id": row["key_id"]}
+
+
+@app.get("/me/signing-key")
+def my_signing_key(
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """返回本账号的审计快照签名公钥与公钥标识。
+
+    复核人须通过带外渠道事先取得并信任该公钥；验真时作为
+    trusted_public_key 提交，服务端不以快照包内自带材料建立信任。
+    首次查询时为账号生成密钥（之后稳定不变，重启也不变）。
+    """
+    with write_tx(db) as tx:
+        info = get_or_create_signing_key(tx, user)
+    return {
+        "username": user["username"],
+        "algorithm": "Ed25519",
+        "key_id": info["key_id"],
+        "public_key": info["public_key"],
+        "public_key_format": "raw-base64:32字节Ed25519公钥的标准base64（也接受PEM）",
+    }
 
 
 @app.get("/health")
@@ -1781,6 +1856,173 @@ def get_audit(
         (doc_id,),
     ).fetchall()
     return {"document_id": doc_id, "records": [dict(row) for row in rows]}
+
+
+# ---------------------------------------------------------------------------
+# 审计快照签发与离线验真
+#
+# 资料参与方（当前封存人或当前指定见证人）在到点开封、清除等结算完成后，
+# 可为某份资料签发审计快照，交给离线复核人核验。快照是一份自描述 JSON：
+# 资料编号、摘要、当前状态与开封/清除时刻、按原顺序排列并标明截止序号的
+# 审计记录——不含正文，也不含任何密钥。签发端用本账号 Ed25519 私钥对快照
+# 的规范化 JSON 签名，返回 {snapshot, signature, key_id}（不含公钥）。
+#
+# 关键不变量：
+# 1) 签发必须对应“一个已提交的一致状态”：进入 BEGIN IMMEDIATE 临界区后
+#    先跑完全部确定性结算（到点开封 -> 到期清除 -> 请求到期 -> 邀请逾期），
+#    再在同一事务内读取资料行与审计行，杜绝把并发操作后的状态与之前的
+#    审计拼接；
+# 2) 非参与方与不存在资料统一 403（沿用既有语义，不区分是否存在）；
+#    交接后旧封存人 owner_id 已变更、又不在见证名单，403 不能再签发；
+#    见证人被替换后同样立即失去签发资格（锁内以当前名单复核）；
+# 3) 验真为公开接口（无需账号密钥），只使用复核人“事先信任的公钥”，
+#    快照结构上禁止携带公钥字段；字段/记录顺序被篡改、签名不匹配、
+#    版本不支持、公钥无效都返回明确的验真失败（HTTP 200 + valid=false
+#    与机器可读 reason），绝不静默通过。
+# ---------------------------------------------------------------------------
+
+
+@app.post("/documents/{doc_id}/audit-snapshot", status_code=201)
+def issue_audit_snapshot(
+    doc_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """签发一份该资料当前已提交状态的签名审计快照。
+
+    快照内容、签名与公钥标识一次返回；响应不含正文，也不含公钥本身。
+    """
+    now = utc_str(now_utc())
+    # 与其他写路径相同：到点结算若在本临界区生效必须先提交，参与方校验
+    # 的拒绝（含“不存在/非参与方”的统一 403）在提交后再返回。
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 第一步：把所有“到点即定”的结算在锁内全部跑完——与扫描器一轮等价，
+        # 保证读到的状态、时刻与审计是同一个已提交一致状态。
+        resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now)
+        expired_requests = expire_due_requests(tx, now)
+        expire_due_invitations(tx, now)
+
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if doc is None:
+            post_commit_error = err(403, "无权访问该资料或资料不存在")
+        else:
+            # 锁内以“当前名单”复核参与方身份：交接后的旧封存人、被替换掉的
+            # 旧见证人此刻都不在名单内，统一拒绝，不区分资料是否存在。
+            is_participant = doc["owner_id"] == user["id"] or tx.execute(
+                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+                (doc_id, user["id"]),
+            ).fetchone() is not None
+            if not is_participant:
+                post_commit_error = err(403, "无权访问该资料或资料不存在")
+
+        if post_commit_error is None:
+            key_info = get_or_create_signing_key(tx, user)
+
+            records_rows = tx.execute(
+                """SELECT a.id AS seq, a.at, a.action, a.detail,
+                          u.username AS actor
+                   FROM audit_log a LEFT JOIN users u ON u.id = a.actor_id
+                   WHERE a.document_id = ?
+                   ORDER BY a.id""",
+                (doc_id,),
+            ).fetchall()
+            records = [
+                {
+                    "seq": row["seq"],
+                    "at": row["at"],
+                    "action": row["action"],
+                    "actor": row["actor"],
+                    "detail": row["detail"],
+                }
+                for row in records_rows
+            ]
+            cutoff_seq = records[-1]["seq"] if records else 0
+
+            snapshot = {
+                "version": SNAPSHOT_VERSION,
+                "document_id": doc["id"],
+                "digest": doc["digest"],
+                "status": doc["status"],
+                "opened_at": doc["opened_at"],
+                "purged_at": doc["purged_at"],
+                "issued_at": now,
+                "issuer": user["username"],
+                "cutoff_seq": cutoff_seq,
+                "records": records,
+            }
+            signature = sign_snapshot(key_info["private_key"], snapshot)
+
+            # 签发本身留痕（不进入本次快照——截止序号是签发前的最后一条审计）。
+            settlement_note = ""
+            if expired_requests:
+                settlement_note = f"；签发临界区内结算了 {expired_requests} 个已过截止时刻的开封请求"
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="audit_snapshot_issued",
+                document_id=doc["id"],
+                detail=(
+                    f"签发审计快照，截止序号 {cutoff_seq}，"
+                    f"当前状态 {doc['status']}，公钥标识 {key_info['key_id']}{settlement_note}"
+                ),
+            )
+
+            result = {
+                "snapshot": snapshot,
+                "signature": signature,
+                "key_id": key_info["key_id"],
+                "algorithm": "Ed25519",
+                "signature_format": "base64:Ed25519(规范化UTF-8 JSON)",
+            }
+
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+@app.post("/audit-snapshots/verify")
+def verify_audit_snapshot(payload: SnapshotVerifyIn) -> dict[str, Any]:
+    """离线验真（公开接口，无需 X-API-Key）。
+
+    复核人提交快照、签发返回的签名与事先通过带外渠道信任的公钥；
+    服务端只按该公钥验签，绝不读取/接受快照包内自带的公钥。无论验真
+    通过与否都返回 HTTP 200 与 valid 布尔值；失败时给出机器可读原因。
+    """
+    snapshot = payload.snapshot
+    # 空信任公钥视为无效公钥（min_length=1 之外的纯空白等情形也在此兜底）
+    if not payload.trusted_public_key.strip():
+        reason = "public_key_invalid"
+    else:
+        # 结构校验失败也算明确失败（version_unsupported / snapshot_malformed /
+        # records_out_of_order / cutoff_seq_mismatch）。
+        try:
+            reason = verify_snapshot(snapshot, payload.signature, payload.trusted_public_key)
+        except SnapshotError as exc:
+            reason = exc.reason
+
+    valid = reason is None
+    result: dict[str, Any] = {
+        "valid": valid,
+        "reason": "ok" if valid else reason,
+    }
+    # 验真通过时回传截止序号与快照要点，便于复核人直接读取结论；
+    # 失败时尽量回传可安全展示的定位信息（全部来自提交包，不含库内数据）。
+    if isinstance(snapshot, dict):
+        result["cutoff_seq"] = snapshot.get("cutoff_seq")
+        result["document_id"] = snapshot.get("document_id")
+        result["version"] = snapshot.get("version")
+        if valid:
+            result["issuer"] = snapshot["issuer"]
+            result["status"] = snapshot["status"]
+            result["digest"] = snapshot["digest"]
+            result["issued_at"] = snapshot["issued_at"]
+            # 提交公钥对应的标识，便于复核人与签发方公布的 key_id 比对
+            result["trusted_key_id"] = public_key_id(payload.trusted_public_key)
+    return result
 
 
 def main() -> None:  # pragma: no cover

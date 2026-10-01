@@ -23,6 +23,18 @@ CREATE TABLE IF NOT EXISTS users (
     created_at  TEXT NOT NULL
 );
 
+-- 审计快照签名密钥：每用户一把 Ed25519 私钥（首次签发时惰性生成）。
+-- 私钥以原始 32 字节存库用于签名，公钥原始 32 字节对外发布；公钥指纹
+-- （SHA-256 十六进制）即 key_id，作为签名对应的公钥标识。WAL 持久化，
+-- 重启后旧签名仍可用同一公钥验证。
+CREATE TABLE IF NOT EXISTS signing_keys (
+    user_id       INTEGER PRIMARY KEY REFERENCES users(id),
+    private_key   TEXT NOT NULL,           -- Ed25519 私钥原始字节（base64 标准字母表）
+    public_key    TEXT NOT NULL,           -- Ed25519 公钥原始字节（base64 标准字母表）
+    key_id        TEXT NOT NULL UNIQUE,    -- "ed25519:" + SHA-256(公钥原始字节) 十六进制
+    created_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS documents (
     id           INTEGER PRIMARY KEY,
     owner_id     INTEGER NOT NULL REFERENCES users(id),

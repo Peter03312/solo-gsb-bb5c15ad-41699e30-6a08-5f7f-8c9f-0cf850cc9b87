@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -73,3 +74,17 @@ class PurgeIn(BaseModel):
         if v.tzinfo is None or v.utcoffset() is None:
             raise ValueError("清除时刻必须带时区信息，例如 2026-10-01T12:00:00Z")
         return v
+
+
+class SnapshotVerifyIn(BaseModel):
+    """离线复核人提交的验真材料：快照、签名与事先信任的公钥。
+
+    snapshot 故意声明为 Any：服务端要把“快照不是 JSON 对象/缺字段”等
+    情况也作为明确的验真失败（HTTP 200 + valid=false）返回，而不是
+    请求层 422。服务端只以 trusted_public_key 验签，绝不从快照内取公钥
+    建立信任；快照结构上也不允许携带公钥字段。
+    """
+
+    snapshot: Any
+    signature: str = Field(min_length=1, max_length=256)
+    trusted_public_key: str = Field(min_length=1, max_length=8192)
