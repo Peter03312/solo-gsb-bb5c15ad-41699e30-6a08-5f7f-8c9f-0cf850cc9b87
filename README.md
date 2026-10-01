@@ -7,7 +7,11 @@
 进行中的开封请求补票；封存人也可就未开封资料向另一名本地账号**发起交接邀请**，
 受让人在截止前确认后成为新封存人。封存人还可为资料**安排到期清除时刻**：
 到点清空正文（保留摘要、参与方与审计元数据），到期前可改期或取消，
-交接后由新封存人管理。技术栈：Python 3.11 + FastAPI + SQLite。
+交接后由新封存人管理。当前封存人或当前指定见证人可在到点开封、清除等结算
+完成后**签发审计快照**（资料编号、摘要、当前状态与开封/清除时刻、按原顺序
+排列且标明截止序号的审计记录，不含正文或密钥），由服务端持久化的 Ed25519
+密钥签名；离线复核人凭“快照 + 签名 + 事先信任的公钥”验真。
+技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
 
@@ -37,7 +41,9 @@
 | 已清除不可再操作 | 已清除资料不能再开封、替换见证人、发起/确认交接或再安排清除；已到期的改期或取消一律 `409`；一切拒绝路径不泄露正文 |
 | 拒绝且状态不变 | 失效凭据(401)、非见证人(403)、无效时限(400/422)、重复开封(409) 等任何拒绝路径都不写数据（到点自动开封/清除的提交除外：状态变更先落库，拒绝在提交后返回） |
 | 并发只产生一个结果 | 全部“检查 + 写入”在 SQLite `BEGIN IMMEDIATE` 短事务内完成；并发同意/撤销/定时开封/到期/替换见证人/交接发起、撤回、确认/到期清除只有一个已提交终态（同意在锁内以“当前名单”复核见证人身份；交接与第二票同意赛跑时要么开封要么交接，互斥且唯一） |
-| 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`（含 `handover_invited/confirmed/revoked/expired`、`request_invalidated`、`purge_scheduled/rescheduled/canceled`、`purged`）；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
+| 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`（含 `handover_invited/confirmed/revoked/expired`、`request_invalidated`、`purge_scheduled/rescheduled/canceled`、`purged`、`audit_snapshot_issued`）；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
+| 审计快照签发 | 当前封存人或当前指定见证人可签发：快照含资料编号、摘要、当前状态与开封/清除时刻、按原顺序排列且标明截止序号（`audit_upto`）的审计记录，不含正文或密钥；签发在同一写事务内先完成到点开封/到期清除等确定性结算再取数，快照对应一个已提交的一致状态 |
+| 快照签名与离线验真 | 服务端 Ed25519 密钥持久化于 `signing_keys` 表（重启后旧签名仍可验证）；复核人提交快照、签名及事先信任的公钥验真，字段或记录顺序被篡改、签名不匹配、版本不支持或公钥无效均明确失败（400），不以包内自带公钥建立信任 |
 
 ### 请求状态机
 
@@ -137,6 +143,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | PUT | `/documents/{id}/purge` | 封存人安排/改期到期清除时刻：`{purge_at}`（带时区、未来时刻） |
 | DELETE | `/documents/{id}/purge` | 封存人在清除时刻到来前取消已安排的清除 |
 | GET | `/documents/{id}/audit` | 按顺序返回该资料的全部操作记录 |
+| POST | `/documents/{id}/audit-snapshots` | 当前封存人或当前指定见证人签发审计快照，返回快照、签名与公钥标识 |
+| GET | `/audit-snapshots/public-key` | 查询快照签名公钥与标识（无需凭据，供复核人事先建立信任） |
+| POST | `/audit-snapshots/verify` | 离线验真：`{snapshot, signature, public_key}`，无需凭据 |
 
 状态码：成功 `200/201`；参数校验失败 `422`（如时间不带时区、`earliest_open_at`
 不早于 `deadline`）；业务校验失败 `400`（如三人不互异、截止时刻已过、最早开封时刻
@@ -408,6 +417,96 @@ curl -sS $BASE/documents/1 -H "X-API-Key: $OWNER_KEY"
 #   没有安排仍取消 409；已清除资料再开封/替换见证人/交接 409。
 ```
 
+### 审计快照签发与离线验真（audit snapshot）
+
+资料参与方需要把封存过程交给离线复核人核验时，**当前封存人或当前指定见证人**
+可在到点开封、清除等结算完成后，为某份资料签发一份**审计快照**。快照包含
+资料编号、摘要、当前状态与开封/清除时刻、按原顺序排列且标明截止序号
+（`audit_upto`）的审计记录，**不含正文，也不含任何密钥**。
+
+- `POST /documents/{id}/audit-snapshots`（需 `X-API-Key`，仅当前封存人或当前
+  指定见证人）：签发在同一写事务内先完成到点开封/到期清除等**确定性结算**，
+  再按该事务的一致视图取数并签名——快照始终对应一个**已提交的一致状态**，
+  不会把并发操作后的状态与之前的审计拼接。签发动作本身追加一条
+  `audit_snapshot_issued` 审计记录（截止序号之前的内容即本次快照）。
+  响应 `201`：
+
+  ```json
+  {
+    "snapshot": {
+      "version": 1,
+      "document_id": 1,
+      "digest": "ab12…",
+      "status": "opened",
+      "created_at": "2026-10-01T08:00:00+00:00",
+      "opened_at": "2026-10-01T09:00:00+00:00",
+      "purge_at": null,
+      "purged_at": null,
+      "audit_upto": 9,
+      "records": [
+        {"seq": 3, "at": "…", "action": "seal", "actor": "alice", "request_id": null, "detail": "…"},
+        {"seq": 9, "at": "…", "action": "opened", "actor": null, "request_id": 1, "detail": "…"}
+      ]
+    },
+    "signature": "rqHz4GK8…（base64，64 字节 Ed25519 签名）",
+    "key_id": "92e97970ddaf5999",
+    "algorithm": "ed25519",
+    "canonicalization": "canonical-json-v1"
+  }
+  ```
+
+- 签名密钥为服务端持有的 **Ed25519** 密钥（纯标准库实现，RFC 8032，无任何
+  第三方依赖），持久化在 `signing_keys` 表（随库备份/重启保留），**重启后
+  旧签名仍可验证**；`key_id` 为公钥 SPKI DER 的 SHA-256 前 16 位十六进制。
+  快照按 `canonical-json-v1` 规范化后签名：`json.dumps(obj, ensure_ascii=True,
+  sort_keys=True, separators=(",", ":"))` 的 ASCII 字节串——键序无关、记录
+  数组顺序敏感，复核方可用任意语言独立重放验证。
+- `GET /audit-snapshots/public-key`（无需凭据）：返回当前签名公钥（PEM，
+  标准 Ed25519 SPKI，OpenSSL/`cryptography` 可直接加载）与 `key_id`，
+  供复核人**事先**通过可信渠道取得并核对指纹后建立信任。
+- `POST /audit-snapshots/verify`（无需凭据）：复核人提交
+  `{"snapshot": <快照对象>, "signature": "<base64 签名>", "public_key": "<事先信任的公钥>"}`。
+  验真**只使用随请求提交的公钥**，绝不从快照包内取公钥建立信任（快照结构
+  严格校验，夹带多余字段直接 `422`）。成功 `200`：
+
+  ```json
+  {"valid": true, "document_id": 1, "status": "opened",
+   "audit_upto": 9, "record_count": 5, "key_id": "92e97970ddaf5999",
+   "algorithm": "ed25519"}
+  ```
+
+- **明确失败**：快照字段值或审计记录顺序被篡改、签名不匹配 → `400`
+  `{"detail": "签名不匹配：…"}`；`version` 不是受支持版本 → `400`
+  `{"detail": "不支持的快照版本: …"}`；公钥无法解析为有效 Ed25519 公钥
+  （垃圾串、长度/前缀不符、曲线外的点）→ `400` `{"detail": "公钥无效：…"}`；
+  快照缺字段/多字段/类型不符 → `422`（错误体不回显提交内容）。
+- 交接后**旧封存人不得再签发**（统一 `403`）；被替换的旧见证人同样失去
+  签发权；非参与方与不存在资料沿用统一 `403` 语义，不区分资料是否存在。
+
+```bash
+# 复核人事先取得签名公钥并建立信任（实际场景应通过可信渠道核对 key_id）
+curl -sS $BASE/audit-snapshots/public-key
+# -> {"algorithm":"ed25519","key_id":"92e97970ddaf5999","public_key":"-----BEGIN PUBLIC KEY-----…"}
+
+# 封存人（或任一当前指定见证人）签发审计快照
+curl -sS -X POST $BASE/documents/1/audit-snapshots -H "X-API-Key: $OWNER_KEY" > snapshot_pkg.json
+# -> {"snapshot":{...,"audit_upto":9,"records":[...]},"signature":"…","key_id":"…",...}
+
+# 复核人离线验真：快照 + 签名 + 事先信任的公钥
+python3 - <<'EOF' > verify_req.json
+import json
+pkg = json.load(open("snapshot_pkg.json"))
+pem = open("trusted_pubkey.pem").read()   # 事先信任渠道获得的公钥
+print(json.dumps({"snapshot": pkg["snapshot"], "signature": pkg["signature"], "public_key": pem}))
+EOF
+curl -sS -X POST $BASE/audit-snapshots/verify \
+  -H 'Content-Type: application/json' -d @verify_req.json
+# -> {"valid":true,"audit_upto":9,"document_id":1,"status":"opened",...}
+
+# 篡改任一字段或调换 records 顺序 -> 400 签名不匹配；version 改 2 -> 400 版本不支持；
+# 公钥换成别的有效 Ed25519 公钥 -> 400 签名不匹配（信任只来自事先信任的公钥）
+```
+
 ### 调用示例（curl）
 
 ```bash
@@ -462,6 +561,7 @@ python3 examples/demo_scheduled.py       # 最早开封时刻：waiting -> 自�
 python3 examples/demo_replace_witness.py # 见证人替换：直接换人 / 退票补票 / waiting 退回待同意
 python3 examples/demo_handover.py        # 封存人交接：邀请/撤回/逾期/确认失效旧请求/转移身份/开封后邀请失效
 python3 examples/demo_purge.py           # 到期清除：安排/改期/取消/到点清除/连带失效/时序规则/交接后管理权
+python3 examples/demo_audit_snapshot.py  # 审计快照：签发/验真/篡改失败/版本与公钥失败/交接后旧封存人禁签
 ```
 
 ### 典型拒绝场景
@@ -505,7 +605,14 @@ python -m pytest -q
 开封更早先开后清（含延迟处理补开）、清除更早则不开封、已清除资料全部写操作 `409`、
 已到期的改期/取消被拒且清除先生效、交接后清除管理权转移、停机期间到点的重启恢复、
 冷读库一致、旧库（无 purge 列/旧 CHECK 约束）幂等迁移，以及真实 uvicorn + 多线程的
-**并发确认 + 同意 vs 到点清除**（两者均被拒，唯一 `purged` 终态）。
+**并发确认 + 同意 vs 到点清除**（两者均被拒，唯一 `purged` 终态）；
+另含审计快照：签发权限（仅当前封存人/当前指定见证人，交接后旧封存人与被替换
+见证人 403、非参与方与不存在资料统一 403）、快照内容（编号/摘要/状态与开封/
+清除时刻/按序审计记录与截止序号，不含正文与密钥）、签发事务内先完成到点开封
+与到期清除结算、签发留痕、篡改字段/调换记录顺序/版本不支持/公钥无效/错公钥/
+夹带公钥自封包全部明确失败、键序无关验真、重启后旧签名仍可验证、真实 uvicorn +
+多线程的**并发签发 vs 第二票同意**（快照始终对应一个已提交的一致状态），
+以及 Ed25519 纯标准库实现的 RFC 8032 官方测试向量。
 
 ## 项目结构
 
@@ -513,12 +620,14 @@ python -m pytest -q
 app/
   config.py     # 环境变量配置
   db.py         # SQLite 连接、建表与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范
-  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻入参校验）
-  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除）
+  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、快照验真入参校验）
+  ed25519.py    # Ed25519 签名（RFC 8032）纯标准库实现，无第三方依赖
+  snapshots.py  # 审计快照：canonical-json-v1 规范化、签名密钥持久化、公钥 PEM/指纹、快照组装与签名
+  main.py       # FastAPI 路由、认证、定时开封+到期清除+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、并发、重启）
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py 端到端示例
+tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、并发、重启）
 Dockerfile
 docker-compose.yml
 ```

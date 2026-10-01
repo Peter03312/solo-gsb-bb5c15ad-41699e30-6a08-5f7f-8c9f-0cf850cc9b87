@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class RegisterIn(BaseModel):
@@ -73,3 +74,49 @@ class PurgeIn(BaseModel):
         if v.tzinfo is None or v.utcoffset() is None:
             raise ValueError("清除时刻必须带时区信息，例如 2026-10-01T12:00:00Z")
         return v
+
+
+# ---------------------------------------------------------------------------
+# 审计快照离线验真
+#
+# 快照本体按“严格结构”校验（字段不多不少），随后对调用方提交的原始 JSON
+# 对象做规范化序列化并验签：字段值或审计记录顺序的任何改动都会改变
+# 规范化字节串，从而验签失败。验真只使用随请求提交的、复核人事先信任的
+# 公钥，绝不从快照包内取公钥建立信任。
+# ---------------------------------------------------------------------------
+
+
+class AuditSnapshotRecordIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int            # 审计记录的全局自增序号（audit_log.id）
+    at: str
+    action: str
+    actor: str | None
+    request_id: int | None
+    detail: str
+
+
+class AuditSnapshotIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int
+    document_id: int
+    digest: str
+    status: str
+    created_at: str
+    opened_at: str | None
+    purge_at: str | None
+    purged_at: str | None
+    audit_upto: int     # 截止序号：快照所包含的最后一条审计记录序号
+    records: list[AuditSnapshotRecordIn]
+
+
+class VerifySnapshotIn(BaseModel):
+    """复核人提交的验真请求：快照 + 签名 + 事先信任的公钥。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot: dict[str, Any]
+    signature: str = Field(min_length=1)   # base64 编码的 64 字节 Ed25519 签名
+    public_key: str = Field(min_length=1)  # PEM（SPKI）或 base64 的 32 字节原始公钥

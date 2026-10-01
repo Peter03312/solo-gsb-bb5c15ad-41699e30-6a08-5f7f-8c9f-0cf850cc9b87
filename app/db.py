@@ -90,6 +90,17 @@ CREATE TABLE IF NOT EXISTS audit_log (
     detail      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_document ON audit_log(document_id);
+
+-- 审计快照签名密钥：单行表，首次使用时生成并持久化，
+-- 重启后旧快照签名仍可验证；secret_seed 仅服务端持有，任何接口不返回。
+CREATE TABLE IF NOT EXISTS signing_keys (
+    id          INTEGER PRIMARY KEY,
+    key_id      TEXT NOT NULL UNIQUE,      -- 公钥标识（SPKI DER 的 SHA-256 前 16 位十六进制）
+    algorithm   TEXT NOT NULL,             -- ed25519
+    public_key  TEXT NOT NULL,             -- PEM（SPKI），可分发给离线复核人
+    secret_seed TEXT NOT NULL,             -- 32 字节签名种子（hex），服务端保密
+    created_at  TEXT NOT NULL
+);
 """
 
 

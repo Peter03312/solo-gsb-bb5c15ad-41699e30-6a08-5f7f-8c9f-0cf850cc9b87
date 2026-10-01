@@ -39,9 +39,17 @@
   一律拒绝且不泄露正文；
 - 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销/定时开封/
   到期/替换见证人/交接确认/到期清除只有一个已提交结果；
+- 当前封存人或当前指定见证人可在到点开封、清除等结算完成后签发**审计快照**：
+  资料编号、摘要、当前状态与开封/清除时刻、按原顺序排列且标明截止序号的
+  审计记录（不含正文与密钥），由服务端持久化的 Ed25519 密钥签名；
+  复核人凭“快照 + 签名 + 事先信任的公钥”离线验真，字段或记录顺序被篡改、
+  签名不匹配、版本不支持或公钥无效均明确失败，且不以包内自带公钥建立信任；
+  签发在同一写事务内先完成确定性结算再取数，快照始终对应一个已提交的一致状态；
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 """
 import asyncio
+import base64
+import binascii
 import hashlib
 import os
 import secrets
@@ -53,11 +61,14 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
+from . import ed25519, snapshots
 from .config import settings
 from .db import connect, init_db, now_utc, utc_str, write_tx
 from .schemas import (
     ApproveIn,
+    AuditSnapshotIn,
     HandoverIn,
     OpenRequestIn,
     PurgeIn,
@@ -65,6 +76,7 @@ from .schemas import (
     ReplaceWitnessIn,
     RevokeIn,
     SealIn,
+    VerifySnapshotIn,
 )
 
 # ---------------------------------------------------------------------------
@@ -463,6 +475,10 @@ sweeper = ExpirySweeper()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await sweeper.start()
+    # 启动即确保审计快照签名密钥存在（不存在则生成并持久化）：
+    # 复核人可在任何快照签发之前取得公钥并事先建立信任；密钥随库保留，
+    # 重启后旧签名仍可验证。
+    await asyncio.to_thread(ensure_signing_key)
     try:
         yield
     finally:
@@ -471,7 +487,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -1781,6 +1797,148 @@ def get_audit(
         (doc_id,),
     ).fetchall()
     return {"document_id": doc_id, "records": [dict(row) for row in rows]}
+
+
+# ---------------------------------------------------------------------------
+# 审计快照签发与离线验真
+#
+# 参与方（当前封存人或当前指定见证人）可为资料签发审计快照：资料编号、摘要、
+# 当前状态与开封/清除时刻、按原顺序排列且标明截止序号的审计记录——不含正文，
+# 也不含任何密钥。签发在同一写事务内先完成到点开封/到期清除等确定性结算再
+# 取数，快照始终对应一个已提交的一致状态（不会把并发操作后的状态与之前的
+# 审计拼接）；签名密钥持久化在 signing_keys 表，重启后旧签名仍可验证。
+#
+# 复核人提交“快照 + 签名 + 事先信任的公钥”验真：字段或记录顺序被篡改、
+# 签名不匹配、版本不支持或公钥无效均明确失败；验真只使用随请求提交的公钥，
+# 绝不从快照包内取公钥建立信任。
+# ---------------------------------------------------------------------------
+
+
+def ensure_signing_key() -> None:
+    """启动时确保签名密钥存在（幂等）；密钥随库持久化，重启后旧签名仍可验证。"""
+    conn = connect()
+    try:
+        with write_tx(conn) as tx:
+            snapshots.load_or_create_signing_key(tx)
+    finally:
+        conn.close()
+
+
+@app.post("/documents/{doc_id}/audit-snapshots", status_code=201)
+def issue_audit_snapshot(
+    doc_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """签发审计快照：仅当前封存人或当前指定见证人；其他情况统一 403。
+
+    临界区内先做确定性到点开封与到期清除结算，再按同一事务内的一致视图
+    组装快照并签名；签发动作本身追加一条审计记录（截止序号之前的状态即
+    本次快照内容），响应不含正文与密钥。
+    """
+    load_doc_for_participant(db, doc_id, user)
+
+    now = utc_str(now_utc())
+    with write_tx(db) as tx:
+        # 先完成到点开封/到期清除等确定性结算：快照只反映结算完成后的状态
+        resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now)
+
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        # 锁内复核参与方身份（交接/替换见证人可能与预校验并发）：以当前名单为准
+        is_party = doc["owner_id"] == user["id"] or tx.execute(
+            "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+            (doc_id, user["id"]),
+        ).fetchone()
+        if not is_party:
+            raise err(403, "无权访问该资料或资料不存在")
+
+        snapshot = snapshots.build_snapshot(tx, doc)
+        key_row = snapshots.load_or_create_signing_key(tx)
+        signature = snapshots.sign_snapshot(key_row, snapshot)
+        add_audit(
+            tx,
+            actor_id=user["id"],
+            action="audit_snapshot_issued",
+            document_id=doc_id,
+            detail=(
+                f"签发审计快照：截止序号 {snapshot['audit_upto']}"
+                f"（{len(snapshot['records'])} 条审计记录），"
+                f"签名公钥标识 {key_row['key_id']}；快照不含正文与密钥"
+            ),
+        )
+        key_id = key_row["key_id"]
+
+    return {
+        "snapshot": snapshot,
+        "signature": signature,
+        "key_id": key_id,
+        "algorithm": snapshots.ALGORITHM,
+        "canonicalization": snapshots.CANONICALIZATION,
+    }
+
+
+@app.get("/audit-snapshots/public-key")
+def get_snapshot_public_key(db: sqlite3.Connection = Depends(get_db)) -> dict[str, Any]:
+    """返回当前快照签名公钥与标识，供离线复核人事先建立信任。
+
+    公钥本身可公开分发（复核人应通过可信渠道核对 key_id / 公钥指纹）；
+    验真接口只使用调用方提交的公钥，不以任何包内夹带的公钥建立信任。
+    """
+    row = db.execute("SELECT * FROM signing_keys ORDER BY id LIMIT 1").fetchone()
+    if row is None:
+        # 兜底：启动流程尚未创建时（如直接调用应用对象）即时生成
+        with write_tx(db) as tx:
+            row = snapshots.load_or_create_signing_key(tx)
+    return snapshots.public_key_info(row)
+
+
+@app.post("/audit-snapshots/verify")
+def verify_audit_snapshot(payload: VerifySnapshotIn) -> dict[str, Any]:
+    """离线验真：复核人提交快照、签名与事先信任的公钥。
+
+    成功返回验真结果与截止序号；字段或记录顺序被篡改、签名不匹配、
+    版本不支持或公钥无效均明确失败（400），结构不合法为 422。
+    无需任何账号凭据；不读取服务端任何数据，信任只来自提交的公钥。
+    """
+    # 1) 结构校验：字段必须不多不少（422，错误体不回显提交内容）
+    try:
+        snap = AuditSnapshotIn.model_validate(payload.snapshot)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
+
+    # 2) 版本必须受支持（版本字段本身也在签名保护之内）
+    if snap.version != snapshots.SNAPSHOT_VERSION:
+        raise err(400, f"不支持的快照版本: {snap.version}")
+
+    # 3) 公钥必须可解析为有效的 Ed25519 公钥
+    try:
+        raw_public_key = snapshots.parse_public_key(payload.public_key)
+    except ValueError as exc:
+        raise err(400, f"公钥无效：{exc}") from exc
+
+    # 4) 签名必须为 base64 编码的 64 字节签名
+    try:
+        signature = base64.b64decode(payload.signature, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise err(400, "签名格式无效：应为 base64 编码的 Ed25519 签名") from exc
+    if len(signature) != 64:
+        raise err(400, "签名格式无效：应为 base64 编码的 64 字节 Ed25519 签名")
+
+    # 5) 对提交的原始快照对象做规范化序列化并验签：字段值或审计记录
+    #    顺序的任何改动都会改变规范化字节串，从而验签失败
+    if not ed25519.verify(raw_public_key, snapshots.canonical_json(payload.snapshot), signature):
+        raise err(400, "签名不匹配：快照字段或审计记录顺序可能被篡改")
+
+    return {
+        "valid": True,
+        "document_id": snap.document_id,
+        "status": snap.status,
+        "audit_upto": snap.audit_upto,
+        "record_count": len(snap.records),
+        "key_id": snapshots.key_id_from_raw(raw_public_key),
+        "algorithm": snapshots.ALGORITHM,
+    }
 
 
 def main() -> None:  # pragma: no cover
